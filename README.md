@@ -3,11 +3,12 @@ ips2svr4
 
 Conversion scripts for taking IPS packages (either from an installed
 system or from the repo created from an Illumos build) and creating an
-equivalent SCR4 package.
+equivalent SVR4 package.
 
 pkg_name.sh - an ugly way to translate IPS package names to SVR4 names
 
 ips2svr4.sh - script to convert a package from an installed system
+
 repo2svr4.sh - script to convert a package from an Illumos build
 
 repo_all.sh, mk_all.sh - wrappers to create all packages
