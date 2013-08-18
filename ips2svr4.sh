@@ -23,13 +23,30 @@
 #
 
 #
+# obvious shortcomings and fixes:
+#
+# 1. any non-file actions need auto-generated scripts to be created
+# 2. What are the real package names?
+# 3. What are the package names used in dependencies? Presumably the
+#   legacy ones, as that's what the svr4 emulation layer creates. In that
+#   case we need to use the legacy names too, or have a translation map
+#   into a private namespace
+# 4. Should skip any package for which pkg.renamed is true; we aren't
+#   that interested in obsoleted packages. Should probably check for
+#   dependencies on renamed packages and correct them, though
+#
+
+#
 # weaknesses of the current implementation
 # 1. no attempt at architecture variants
 # 2. fixed paths
 # 3. need to fully handle set actions
 # 4. need to fully handle driver actions
-# 5. handle reboot-needed
-# 6. Need to handle global/ngz
+# 5. need to check dependencies, once we've solved package naming
+# 6. handle reboot-needed
+# 7. handle editable files (how identified - preserve=renamenew ?)
+# 8. Need to handle multiple legacy lines in a single manifest (eg ZFS)
+# 9. Need to handle global/ngz
 #
 
 #
@@ -99,29 +116,6 @@ fi
 }
 
 #
-# class action scripts
-#
-init_preserve() {
-mkdir -p ${BDIR}/install
-if [ ! -f ${BDIR}/install/i.preserve ]; then
-cat > ${BDIR}/install/i.preserve <<EOF
-#!/bin/sh
-#
-# bone-headed class-action script for preserve
-#
-while read src dest
-do
-  if [ ! -f $dest ] ; then
-    cp $src $dest
-  fi
-done
-exit 0
-EOF
-echo "i i.preserve=./install/i.preserve" >> ${BDIR}/prototype
-fi
-}
-
-#
 # initialise dependency handling
 #
 init_depend() {
@@ -140,57 +134,6 @@ fi
 }
 
 #
-# if there are services that should be restarted, add them to the postinstall
-# script
-#
-handle_restarts() {
-if [ -f ${BDIR}/restart_fmri_list ]; then
-mkdir -p ${BDIR}/install
-if [ ! -f ${BDIR}/install/postinstall ]; then
-cat > ${BDIR}/install/postinstall <<EOF
-#!/sbin/sh
-#
-# Automatically generated service restart script
-#
-EOF
-cat > ${BDIR}/install/postremove <<EOF
-#!/sbin/sh
-#
-# Automatically generated service restart script
-#
-EOF
-chmod a+x ${BDIR}/install/postremove ${BDIR}/install/postinstall
-echo "i postinstall=./install/postinstall" >> ${BDIR}/prototype
-echo "i postremove=./install/postremove" >> ${BDIR}/prototype
-fi
-#
-# this check is so we only actually restart if the install is to the
-# current system. If we're installing to an alternate image, then the
-# restarts will happen automatically when it boots
-#
-# FIXME should the restart be -s
-#
-cat >> ${BDIR}/install/postinstall <<EOF
-if [ "\${BASEDIR}" = "/" ]; then
-EOF
-cat >> ${BDIR}/install/postremove <<EOF
-if [ "\${BASEDIR}" = "/" ]; then
-EOF
-/usr/bin/cat ${BDIR}/restart_fmri_list | /usr/bin/sort | /usr/bin/uniq | /usr/bin/awk '{print "/usr/sbin/svcadm restart "$1}' >> ${BDIR}/install/postinstall
-/usr/bin/cat ${BDIR}/restart_fmri_list | /usr/bin/sort | /usr/bin/uniq | /usr/bin/awk '{print "/usr/sbin/svcadm restart "$1}' >> ${BDIR}/install/postremove
-echo "fi" >> ${BDIR}/install/postinstall
-echo "fi" >> ${BDIR}/install/postremove
-#
-# some of the packages have broken dependencies, so we exit cleanly to
-# stop errors from missing services messing up pkgadd or pkgrm
-#
-echo "exit 0" >> ${BDIR}/install/postinstall
-echo "exit 0" >> ${BDIR}/install/postremove
-/usr/bin/rm ${BDIR}/restart_fmri_list
-fi
-}
-
-#
 # parse a driver line in the manifest
 # should have name, maybe alias and perms
 # FIXME policy privilege
@@ -200,10 +143,8 @@ handle_driver() {
 HAS_CONTENT=true
 init_driver
 CMD_FRAG='${CMD} ${BFLAGS}'
-UCMD_FRAG='/usr/sbin/update_drv ${BFLAGS}'
 DNAME=""
 PERMS=""
-CLONEPERMS=""
 ALIASES=""
 CLASS=""
 for frag in "$@"
@@ -235,37 +176,16 @@ class)
 *zone*)
     printf ""
     ;;
-clone_perms)
-    CLONEPERMS="'$value'"
-    ;;
 *)
     echo unhandled driver action $frag
     ;;
 esac
 done
-#
-# ddi_pseudo confuses the parser, override where it breaks
-#
-if [ "x${INPKG}" = "xdriver%2Fx11%2Fxsvc" ]; then
-    DNAME="xsvc"
-fi
-if [ "x${INPKG}" = "xdriver%2Fstorage%2Fcpqary3" ]; then
-    DNAME="cpqary3"
-fi
-if [ "x${INPKG}" = "xdriver%2Fcrypto%2Ftpm" ]; then
-    DNAME="tpm"
-    PERMS="-m '* 0600 root sys'"
-fi
 if [ "x${ALIASES}" != "x" ]; then
     ALIASES="${ALIASES}'"
 fi
-if [ "x${DNAME}" != "x" ]; then
-    echo "${CMD_FRAG} ${PERMS} ${ALIASES} ${CLASS} $DNAME" >> ${BDIR}/install/postinstall
-    echo "${CMD_FRAG} $DNAME" >> ${BDIR}/install/postremove
-fi
-if [ "x${CLONEPERMS}" != "x" ]; then
-    echo "${UCMD_FRAG} -a -m ${CLONEPERMS} clone" >> ${BDIR}/install/postinstall
-fi
+echo "${CMD_FRAG} ${PERMS} ${ALIASES} ${CLASS} $DNAME" >> ${BDIR}/install/postinstall
+echo "${CMD_FRAG} $DNAME" >> ${BDIR}/install/postremove
 }
 
 #
@@ -376,14 +296,15 @@ echo "l none ${dirpath}=${target}" >> ${BDIR}/prototype
 # ignore the pkg.size and pkg.csize attributes we don't use them anyway
 # ignore chash and elfhash, as we don't use them either
 #
+# FIXME handle restart_fmri, by adding a postinstall script that does a
+# svcadm restart on the argument (if on a live system)
+#
 # cp -p retains the timestamp; this allows repeated invocations of this
 # script to generate identical packages, but if the timestamp is set in
 # the manifest we explicitly touch the file to that date
 #
 handle_file() {
 HAS_CONTENT=true
-FTYPE="f"
-FCLASS="none"
 TSTAMP=""
 echo $* | read fhash line
 # file in the repo is ${REPODIR}/file/${fh}/${fhash}
@@ -419,15 +340,6 @@ timestamp)
 facet*)
     printf ""
     ;;
-restart_fmri)
-    touch ${BDIR}/restart_fmri_list
-    echo $value >>${BDIR}/restart_fmri_list
-    ;;
-preserve)
-    FTYPE="e"
-    #FCLASS="preserve"
-    #init_preserve
-    ;;
 *)
     echo "unhandled file attribute $frag"
     ;;
@@ -435,6 +347,7 @@ esac
 done
 dpath=`dirname $filepath`
 if [ ! -d ${BDIR}/${dpath} ]; then
+    echo mkdir -p ${BDIR}/${dpath}
     mkdir -p ${BDIR}/${dpath}
 fi
 if [ -f ${BDIR}/${filepath} ]; then
@@ -447,7 +360,7 @@ if [ -f ${REPODIR}/${filepath} ]; then
     if [ "xx${TSTAMP}" != "xx" ]; then
 	/bin/touch -t ${TSTAMP} ${BDIR}/${filepath}
     fi
-    echo "${FTYPE} ${FCLASS} ${filepath}=${filepath} ${mode} ${owner} ${group}" >> ${BDIR}/prototype
+    echo "f none ${filepath}=${filepath} ${mode} ${owner} ${group}" >> ${BDIR}/prototype
 else
     echo "ERROR: missing file ${REPODIR}/${filepath}"
 fi
@@ -581,16 +494,9 @@ pkg*)
     pkg_str=`echo $fmri | sed 's=^pkg:/=='`
     pkg_name=`echo $pkg_str | awk -F@ '{print $1}'`
     pkg_vers=`echo $pkg_str | awk -F@ '{print $2}'`
-case $pkg_name in
-*incorporation)
-    printf ""
-    ;;
-*)
     svr4_name=`$PNAME $pkg_name`
     init_depend
     echo "P $svr4_name" >> ${BDIR}/install/depend
-    ;;
-esac
     ;;
 *)
     printf ""
@@ -727,23 +633,15 @@ fi
 # need to reset kernel state files back to null
 # (IMHO, that these files are editable is a bug)
 #
-# also remove history of the current live system
+# I use /etc/passwd as the source for the timestamp so that repeated runs
+# generate identical packages.
 #
 cd $BDIR
 if [ -f etc/logadm.conf ]; then
     touch -r /etc/passwd etc/logadm.conf
 fi
 if [ -f etc/user_attr ]; then
-    cat /etc/user_attr | grep -v ptribble > etc/user_attr
     touch -r /etc/passwd etc/user_attr
-fi
-if [ -f etc/passwd ]; then
-    cat /etc/passwd | grep -v ptribble > etc/passwd
-    touch -r /etc/passwd etc/passwd
-fi
-if [ -f etc/shadow ]; then
-    cat /etc/shadow | grep -v ptribble > etc/shadow
-    touch -r /etc/passwd etc/shadow
 fi
 if [ -f etc/security/auth_attr ]; then
     touch -r /etc/passwd etc/security/auth_attr
@@ -762,10 +660,6 @@ if [ -f etc/driver_aliases ]; then
     cp /dev/null etc/driver_aliases
     touch -r /etc/passwd etc/driver_aliases
 fi
-if [ -f etc/driver_classes ]; then
-    cp /dev/null etc/driver_classes
-    touch -r /etc/passwd etc/driver_classes
-fi
 if [ -f etc/minor_perm ]; then
     cp /dev/null etc/minor_perm
     touch -r /etc/passwd etc/minor_perm
@@ -778,49 +672,6 @@ if [ -f etc/mnttab ]; then
     cp /dev/null etc/mnttab
     touch -r /etc/passwd etc/mnttab
 fi
-if [ -f etc/auto_home ]; then
-    cat /etc/auto_home | grep -v localhost: > etc/auto_home
-    touch -r /etc/passwd etc/auto_home
-fi
-if [ -f etc/inet/hosts ]; then
-    HNAME=`/usr/bin/hostname`
-    cat /etc/inet/hosts | sed s:${HNAME}:tribblix:g > etc/inet/hosts
-    touch -r /etc/passwd etc/inet/hosts
-fi
-if [ -f var/adm/utmpx ]; then
-    cp /dev/null var/adm/utmpx
-    touch -r /etc/passwd var/adm/utmpx
-fi
-if [ -f var/adm/wtmpx ]; then
-    cp /dev/null var/adm/wtmpx
-    touch -r /etc/passwd var/adm/wtmpx
-fi
-if [ -f root/.bashrc ]; then
-cat > root/.bashrc <<EOF
-PS1='\u@\h:\w\\\$ '
-EOF
-fi
-if [ -f root/.profile ]; then
-cat > root/.profile <<EOF
-#
-# Simple profile places /usr/gnu/bin at front,
-# adds /usr/sbin and /sbin to the end.
-#
-export PATH=/usr/gnu/bin:/usr/bin:/usr/sbin:/sbin
-export PAGER="more -s"
-
-#
-# Define default prompt to <username>@<hostname>:<path><"($|#) "
-#
-PS1='root@\$(/usr/bin/hostname):\$(
-    printf "%s" "\${PWD/\${HOME}/~}# ")'
-EOF
-fi
-
-#
-# if there were any services that need to be restarted, create install scripts
-#
-handle_restarts
 
 #
 # build a package
